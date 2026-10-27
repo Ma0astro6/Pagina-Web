@@ -1,0 +1,959 @@
+<!DOCTYPE html>
+<html lang="es-CL">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#140e1c">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Cerro">
+  <meta name="description" content="Apila casas cerro arriba. Un toque.">
+  <title>Cerro</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect fill='%23241830' width='64' height='64'/%3E%3Crect x='14' y='30' width='36' height='22' fill='%23e07a3d'/%3E%3Crect x='14' y='22' width='36' height='10' fill='%23a84e22'/%3E%3Crect x='20' y='36' width='8' height='8' fill='%23ffe7a3'/%3E%3Crect x='36' y='36' width='8' height='8' fill='%23ffe7a3'/%3E%3C/svg%3E">
+  <link rel="manifest" href="manifest.webmanifest">
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #140e1c;
+      overflow: hidden;
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior: none;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+    #sat, #sab {
+      position: fixed;
+      left: 0;
+      width: 0;
+      pointer-events: none;
+    }
+    #sat { top: 0; height: env(safe-area-inset-top); }
+    #sab { bottom: 0; height: env(safe-area-inset-bottom); }
+    .sr {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      border: 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="sat"></div>
+  <div id="sab"></div>
+  <canvas id="c" role="application" aria-label="Cerro. Toca para soltar la casa cuando calce con la de abajo."></canvas>
+  <div id="live" class="sr" aria-live="polite"></div>
+  <script>
+    (() => {
+      const canvas = document.getElementById("c");
+      const ctx = canvas.getContext("2d");
+      const live = document.getElementById("live");
+      const FACADES = [
+        { wall: "#f2c14e", win: "#2a2418", lit: "#ffe7a3", trim: "#c4842a" },
+        { wall: "#e07a8c", win: "#2c1820", lit: "#ffd0c8", trim: "#a84860" },
+        { wall: "#3aa8a0", win: "#102826", lit: "#d8fff6", trim: "#1d6e6a" },
+        { wall: "#f4efe4", win: "#243044", lit: "#fff4d2", trim: "#c9b89a" },
+        { wall: "#e07a3d", win: "#2a160e", lit: "#ffe0b0", trim: "#a84e22" },
+        { wall: "#6ea0e0", win: "#152033", lit: "#e7f1ff", trim: "#3a6eae" },
+        { wall: "#d64545", win: "#2a1010", lit: "#ffd0c4", trim: "#8e2424" },
+        { wall: "#7dba6a", win: "#142414", lit: "#e9ffd8", trim: "#3f7a38" }
+      ];
+      const stars = Array.from({ length: 72 }, (_, i) => ({
+        x: ((i * 47) % 100) / 100,
+        y: ((i * 29) % 70) / 100,
+        r: i % 5 === 0 ? 1.7 : 1,
+        p: (i * 0.7) % (Math.PI * 2)
+      }));
+
+      let viewW = 0;
+      let viewH = 0;
+      let state = "title";
+      let stack = [];
+      let mover = null;
+      let debris = [];
+      let particles = [];
+      let cam = 0;
+      let combo = 0;
+      let bestCombo = 0;
+      let best = 0;
+      let muted = false;
+      let record = false;
+      let shakeAmp = 0;
+      let flash = null;
+      let missUntil = 0;
+      let lastAct = 0;
+      let lastFrame = performance.now();
+      let announced = "";
+      let audioCtx = null;
+
+      function safeTop() {
+        return document.getElementById("sat").getBoundingClientRect().height || 0;
+      }
+      function safeBot() {
+        return document.getElementById("sab").getBoundingClientRect().height || 0;
+      }
+      function houses() {
+        let n = 0;
+        for (const block of stack) if (block.kind === "house") n++;
+        return n;
+      }
+      function say(text) {
+        if (announced === text) return;
+        announced = text;
+        live.textContent = text;
+      }
+      function loadSave() {
+        try {
+          best = Number(localStorage.getItem("cerro.best")) || 0;
+          muted = localStorage.getItem("cerro.mute") === "1";
+        } catch (err) {
+          best = 0;
+          muted = false;
+        }
+      }
+      function saveBest() {
+        try { localStorage.setItem("cerro.best", String(best)); } catch (err) {}
+      }
+      function saveMute() {
+        try { localStorage.setItem("cerro.mute", muted ? "1" : "0"); } catch (err) {}
+      }
+      function ac() {
+        if (!audioCtx) {
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          if (!Ctx) return null;
+          audioCtx = new Ctx();
+        }
+        if (audioCtx.state === "suspended") audioCtx.resume();
+        return audioCtx;
+      }
+      function tone(freq, dur, type, vol, delay) {
+        if (muted) return;
+        try {
+          const a = ac();
+          if (!a) return;
+          const t0 = a.currentTime + (delay || 0);
+          const osc = a.createOscillator();
+          const gain = a.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, t0);
+          gain.gain.setValueAtTime(vol, t0);
+          gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+          osc.connect(gain);
+          gain.connect(a.destination);
+          osc.start(t0);
+          osc.stop(t0 + dur + 0.02);
+        } catch (err) {}
+      }
+      function buzz(pattern) {
+        if (navigator.vibrate) navigator.vibrate(pattern);
+      }
+      function toggleMute() {
+        muted = !muted;
+        saveMute();
+        if (!muted) tone(660, 0.07, "sine", 0.04);
+      }
+      function zone(n) {
+        if (n >= 40) return "Las nubes";
+        if (n >= 25) return "La cima";
+        if (n >= 12) return "El cerro";
+        if (n >= 5) return "Las laderas";
+        return "El puerto";
+      }
+      function headline(n) {
+        if (n <= 0) return "Se te fue al tiro";
+        if (n < 5) return "Recién partiendo";
+        if (n < 12) return "Vas por las laderas";
+        if (n < 25) return "Vas subiendo el cerro";
+        if (n < 40) return "Casi en la cima";
+        return "Te perdiste en las nubes";
+      }
+      function sy(worldY) {
+        return viewH - (worldY - cam);
+      }
+      function muteRect() {
+        const size = 44;
+        return {
+          x: viewW - size - 12,
+          y: safeTop() + 10,
+          w: size,
+          h: size
+        };
+      }
+      function hit(rect, x, y) {
+        return x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h;
+      }
+      function roundRectPath(x, y, w, h, r) {
+        const radius = Math.max(0, Math.min(r, w / 2, h / 2));
+        ctx.beginPath();
+        ctx.moveTo(x + radius, y);
+        ctx.arcTo(x + w, y, x + w, y + h, radius);
+        ctx.arcTo(x + w, y + h, x, y + h, radius);
+        ctx.arcTo(x, y + h, x, y, radius);
+        ctx.arcTo(x, y, x + w, y, radius);
+        ctx.closePath();
+      }
+      function lerp(a, b, t) {
+        return a + (b - a) * t;
+      }
+      function mix(a, b, t) {
+        return [
+          Math.round(lerp(a[0], b[0], t)),
+          Math.round(lerp(a[1], b[1], t)),
+          Math.round(lerp(a[2], b[2], t))
+        ];
+      }
+      function rgb(c) {
+        return "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
+      }
+      function skyStops(alt) {
+        const duskTop = [78, 48, 112];
+        const duskBot = [236, 156, 106];
+        const nightTop = [8, 12, 28];
+        const nightBot = [32, 48, 92];
+        const spaceTop = [3, 5, 12];
+        const spaceBot = [10, 14, 32];
+        if (alt < 1) {
+          return { top: mix(duskTop, nightTop, alt), bot: mix(duskBot, nightBot, alt) };
+        }
+        const u = Math.min(1, alt - 1);
+        return { top: mix(nightTop, spaceTop, u), bot: mix(nightBot, spaceBot, u) };
+      }
+      function resize() {
+        const oldW = viewW;
+        viewW = window.innerWidth;
+        viewH = window.innerHeight;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.round(viewW * dpr);
+        canvas.height = Math.round(viewH * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        if (oldW > 0 && Math.abs(oldW - viewW) > 1) {
+          const scale = viewW / oldW;
+          for (const block of stack) {
+            block.x *= scale;
+            block.w *= scale;
+          }
+          if (mover) {
+            mover.x *= scale;
+            mover.w *= scale;
+          }
+          for (const piece of debris) {
+            piece.x *= scale;
+            piece.w *= scale;
+          }
+        }
+      }
+      function limits(width) {
+        const minX = 14;
+        const maxX = Math.max(minX, viewW - 14 - width);
+        return { minX, maxX };
+      }
+      function spawnMover() {
+        const prev = stack[stack.length - 1];
+        const box = limits(prev.w);
+        const dir = houses() % 2 === 0 ? 1 : -1;
+        mover = {
+          x: dir === 1 ? box.minX : box.maxX,
+          y: prev.y + prev.h,
+          w: prev.w,
+          h: 40,
+          dir,
+          age: 0,
+          facade: FACADES[houses() % FACADES.length],
+          seed: houses() + 3
+        };
+      }
+      function reset() {
+        const bw = Math.min(220, Math.max(120, viewW * 0.5));
+        stack = [{
+          x: (viewW - bw) / 2,
+          y: 0,
+          w: bw,
+          h: 54,
+          kind: "ground"
+        }];
+        debris = [];
+        particles = [];
+        combo = 0;
+        bestCombo = 0;
+        record = false;
+        flash = null;
+        shakeAmp = 0;
+        spawnMover();
+        cam = mover.y + mover.h - viewH + safeTop() + 128;
+      }
+      function start() {
+        reset();
+        state = "playing";
+        ac();
+        say("Empezó. Suelta la casa cuando calce.");
+      }
+      function burst(x, worldY, color) {
+        for (let i = 0; i < 12; i++) {
+          particles.push({
+            x,
+            y: worldY,
+            vx: (Math.random() - 0.5) * 220,
+            vy: 60 + Math.random() * 180,
+            life: 1,
+            color
+          });
+        }
+      }
+      function spawnDebris(x, y, w, h, facade, seed, vx) {
+        debris.push({
+          x, y, w, h, facade, seed,
+          vx,
+          vy: 90,
+          rot: 0,
+          vr: (vx >= 0 ? 1 : -1) * 2.4
+        });
+      }
+      function setFlash(text) {
+        flash = { text, a: 1.15 };
+      }
+      function drop() {
+        if (!mover || state !== "playing") return;
+        const prev = stack[stack.length - 1];
+        const left = Math.max(mover.x, prev.x);
+        const right = Math.min(mover.x + mover.w, prev.x + prev.w);
+        const overlap = right - left;
+        const slack = Math.max(8, viewW * 0.018);
+        if (overlap < 2) {
+          miss();
+          return;
+        }
+        const perfect = Math.abs(mover.x - prev.x) <= slack;
+        if (perfect) {
+          combo += 1;
+          if (combo > bestCombo) bestCombo = combo;
+          stack.push({
+            x: prev.x,
+            y: mover.y,
+            w: prev.w,
+            h: mover.h,
+            kind: "house",
+            facade: mover.facade,
+            seed: mover.seed
+          });
+          shakeAmp = 6;
+          burst(prev.x + prev.w / 2, mover.y + mover.h, mover.facade.lit);
+          tone(523, 0.1, "sine", 0.06);
+          tone(784, 0.14, "sine", 0.045, 0.05);
+          buzz(12);
+          if (combo >= 8) setFlash("¡De otro plano!");
+          else if (combo >= 5) setFlash("¡Impecable!");
+          else if (combo >= 3) setFlash("¡Filete!");
+          else setFlash("¡Calza!");
+        } else {
+          combo = 0;
+          const cutLeft = mover.x < prev.x;
+          const cutW = mover.w - overlap;
+          const cutX = cutLeft ? mover.x : right;
+          spawnDebris(cutX, mover.y, cutW, mover.h, mover.facade, mover.seed, cutLeft ? -70 : 70);
+          stack.push({
+            x: left,
+            y: mover.y,
+            w: overlap,
+            h: mover.h,
+            kind: "house",
+            facade: mover.facade,
+            seed: mover.seed
+          });
+          shakeAmp = 3.5;
+          tone(196, 0.08, "triangle", 0.05);
+          buzz(8);
+        }
+        say(houses() + (houses() === 1 ? " casa" : " casas"));
+        spawnMover();
+      }
+      function miss() {
+        spawnDebris(mover.x, mover.y, mover.w, mover.h, mover.facade, mover.seed, mover.dir * 40);
+        mover = null;
+        state = "miss";
+        missUntil = performance.now() + 740;
+        shakeAmp = 9;
+        const score = houses();
+        record = score > best && score > 0;
+        if (score > best) {
+          best = score;
+          saveBest();
+        }
+        try {
+          const a = ac();
+          if (a && !muted) {
+            const t0 = a.currentTime;
+            const osc = a.createOscillator();
+            const gain = a.createGain();
+            osc.type = "triangle";
+            osc.frequency.setValueAtTime(180, t0);
+            osc.frequency.exponentialRampToValueAtTime(55, t0 + 0.28);
+            gain.gain.setValueAtTime(0.05, t0);
+            gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.3);
+            osc.connect(gain);
+            gain.connect(a.destination);
+            osc.start(t0);
+            osc.stop(t0 + 0.32);
+          }
+        } catch (err) {}
+        buzz([18, 36, 24]);
+        say("Se acabó. " + score + (score === 1 ? " casa." : " casas."));
+      }
+      function onAction() {
+        const now = performance.now();
+        if (now - lastAct < 110) return;
+        lastAct = now;
+        if (state === "title" || state === "over") start();
+        else if (state === "paused") {
+          state = "playing";
+          lastFrame = now;
+        } else if (state === "playing") drop();
+      }
+      function onPointer(event) {
+        event.preventDefault();
+        const rect = canvas.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        if (hit(muteRect(), x, y)) {
+          toggleMute();
+          return;
+        }
+        onAction();
+      }
+      function update(dt) {
+        if (state === "playing" && mover) {
+          mover.age += dt;
+          const built = houses();
+          const span = viewW / 390;
+          const cruise = Math.min(1, mover.age / 200);
+          const speed = Math.min(145 + built * 8.5, 470) * span * (0.4 + 0.6 * cruise);
+          const box = limits(mover.w);
+          mover.x += mover.dir * speed * dt / 1000;
+          if (mover.x <= box.minX) {
+            mover.x = box.minX;
+            mover.dir = 1;
+          } else if (mover.x >= box.maxX) {
+            mover.x = box.maxX;
+            mover.dir = -1;
+          }
+          const roof = mover.y + mover.h;
+          const desiredTop = safeTop() + 128;
+          const target = roof - viewH + desiredTop;
+          cam += (target - cam) * (1 - Math.exp(-dt / 70));
+          const minCam = roof - viewH + safeTop() + 116;
+          if (cam < minCam) cam = minCam;
+        }
+        if (state === "miss" && performance.now() >= missUntil) state = "over";
+        for (let i = debris.length - 1; i >= 0; i--) {
+          const piece = debris[i];
+          piece.vy -= 1500 * dt / 1000;
+          piece.y += piece.vy * dt / 1000;
+          piece.x += piece.vx * dt / 1000;
+          piece.rot += piece.vr * dt / 1000;
+          if (sy(piece.y) > viewH + 280) debris.splice(i, 1);
+        }
+        for (let i = particles.length - 1; i >= 0; i--) {
+          const bit = particles[i];
+          bit.vy -= 720 * dt / 1000;
+          bit.y += bit.vy * dt / 1000;
+          bit.x += bit.vx * dt / 1000;
+          bit.life -= dt / 520;
+          if (bit.life <= 0) particles.splice(i, 1);
+        }
+        if (flash) {
+          flash.a -= dt / 760;
+          if (flash.a <= 0) flash = null;
+        }
+        if (shakeAmp > 0) shakeAmp *= Math.exp(-dt / 90);
+      }
+      function drawSky(alt) {
+        const stops = skyStops(alt);
+        const gradient = ctx.createLinearGradient(0, 0, 0, viewH);
+        gradient.addColorStop(0, rgb(stops.top));
+        gradient.addColorStop(1, rgb(stops.bot));
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, viewW, viewH);
+      }
+      function drawStars(alpha) {
+        if (alpha <= 0.02) return;
+        for (const star of stars) {
+          const twinkle = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(performance.now() / 380 + star.p));
+          ctx.globalAlpha = alpha * twinkle;
+          ctx.fillStyle = "#fff6ea";
+          ctx.fillRect(star.x * viewW, star.y * viewH, star.r, star.r);
+        }
+        ctx.globalAlpha = 1;
+      }
+      function drawMoon(yPos) {
+        const radius = Math.min(22, viewW * 0.048);
+        const x = viewW - 28 - radius;
+        const y = yPos;
+        ctx.fillStyle = "#f6e7c1";
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "rgba(120, 90, 50, 0.16)";
+        ctx.beginPath();
+        ctx.arc(x - 6, y - 3, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(x + 4, y + 5, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      function drawRidge(baseY, color, peaks) {
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(0, baseY + 80);
+        ctx.lineTo(0, baseY);
+        for (const peak of peaks) ctx.lineTo(viewW * peak.x, baseY - peak.h);
+        ctx.lineTo(viewW, baseY);
+        ctx.lineTo(viewW, baseY + 80);
+        ctx.closePath();
+        ctx.fill();
+      }
+      function drawMountains(baseY) {
+        const scale = Math.max(0.78, Math.min(1.2, viewH / 800));
+        const far = [
+          { x: 0.04, h: 36 * scale },
+          { x: 0.14, h: 108 * scale },
+          { x: 0.28, h: 62 * scale },
+          { x: 0.46, h: 28 * scale },
+          { x: 0.64, h: 48 * scale },
+          { x: 0.82, h: 116 * scale },
+          { x: 0.96, h: 40 * scale }
+        ];
+        const near = [
+          { x: 0.1, h: 34 * scale },
+          { x: 0.3, h: 18 * scale },
+          { x: 0.72, h: 22 * scale },
+          { x: 0.92, h: 40 * scale }
+        ];
+        drawRidge(baseY + 8, "#31445f", far);
+        for (const peak of [far[1], far[5]]) {
+          ctx.fillStyle = "#f7f5ef";
+          ctx.beginPath();
+          ctx.moveTo(viewW * peak.x - 12, baseY + 8 - peak.h + 18);
+          ctx.lineTo(viewW * peak.x, baseY + 8 - peak.h);
+          ctx.lineTo(viewW * peak.x + 13, baseY + 8 - peak.h + 20);
+          ctx.fill();
+        }
+        drawRidge(baseY + 24, "#243246", near);
+      }
+      function drawSea(seaY) {
+        if (seaY > viewH + 20) return;
+        const gradient = ctx.createLinearGradient(0, seaY, 0, Math.max(viewH, seaY + 40));
+        gradient.addColorStop(0, "#1d6d88");
+        gradient.addColorStop(1, "#0d3348");
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, seaY, viewW, Math.max(0, viewH - seaY));
+        ctx.strokeStyle = "rgba(255,255,255,0.2)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        const time = performance.now() / 420;
+        for (let x = 0; x <= viewW; x += 6) {
+          const y = seaY + 12 + Math.sin(x * 0.035 + time) * 2.2;
+          if (x === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.strokeStyle = "rgba(255,255,255,0.1)";
+        ctx.beginPath();
+        for (let x = 0; x <= viewW; x += 8) {
+          const y = seaY + 36 + Math.sin(x * 0.02 + time * 0.8) * 2;
+          if (x === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        drawBoat(viewW * 0.16, seaY + 22, 30);
+        drawBoat(viewW * 0.74, seaY + 30, 40);
+      }
+      function drawBoat(x, y, w) {
+        ctx.fillStyle = "#f3ecdf";
+        ctx.fillRect(x, y, w, 7);
+        ctx.fillStyle = "#c4473a";
+        ctx.beginPath();
+        ctx.moveTo(x + w * 0.42, y);
+        ctx.lineTo(x + w * 0.42, y - 16);
+        ctx.lineTo(x + w * 0.78, y);
+        ctx.fill();
+      }
+      function drawHouse(x, y, w, h, facade, seed, active) {
+        ctx.fillStyle = facade.wall;
+        ctx.fillRect(x, y, w, h);
+        const roofH = Math.max(6, Math.min(12, h * 0.26));
+        ctx.fillStyle = facade.trim;
+        ctx.fillRect(x, y, w, roofH);
+        ctx.strokeStyle = "rgba(0,0,0,0.18)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let line = x + 4; line < x + w; line += 5) {
+          ctx.moveTo(line, y + 1);
+          ctx.lineTo(line, y + roofH);
+        }
+        ctx.stroke();
+        ctx.fillStyle = "rgba(0,0,0,0.12)";
+        ctx.fillRect(x + w - 4, y, 4, h);
+        if (w >= 26 && h >= 24) {
+          const winW = w > 150 ? 13 : 10;
+          const winH = Math.min(13, h * 0.36);
+          const gap = 7;
+          let cols = Math.floor((w - 14) / (winW + gap));
+          cols = Math.max(1, Math.min(w > 170 ? 5 : 4, cols));
+          const total = cols * winW + (cols - 1) * gap;
+          let sx = x + (w - total) / 2;
+          const wy = y + roofH + Math.max(3, (h - roofH - winH) / 2);
+          for (let i = 0; i < cols; i++) {
+            ctx.fillStyle = facade.win;
+            ctx.fillRect(sx, wy, winW, winH);
+            if (active || (seed + i) % 3 !== 0) {
+              ctx.fillStyle = facade.lit;
+              ctx.fillRect(sx + 1.5, wy + 1.5, winW - 3, Math.max(2, winH * 0.48));
+            }
+            sx += winW + gap;
+          }
+        }
+        if (active) {
+          ctx.strokeStyle = "rgba(255,248,236,0.92)";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(x + 1.5, y + 1.5, w - 3, h - 3);
+        }
+      }
+      function drawGround(block) {
+        const y = sy(block.y + block.h);
+        ctx.fillStyle = "#7a5340";
+        ctx.fillRect(block.x, y, block.w, block.h);
+        ctx.fillStyle = "#8f624b";
+        for (let i = 0; i < 5; i++) {
+          const px = block.x + 12 + ((i * 37) % Math.max(1, block.w - 24));
+          ctx.beginPath();
+          ctx.ellipse(px, y + 24, 5, 3.5, 0, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.fillStyle = "#3f6b48";
+        ctx.fillRect(block.x, y, block.w, 8);
+        ctx.fillStyle = "rgba(0,0,0,0.16)";
+        ctx.fillRect(block.x, y + block.h - 7, block.w, 7);
+      }
+      function drawBlock(block, active) {
+        if (block.kind === "ground") {
+          drawGround(block);
+          return;
+        }
+        drawHouse(block.x, sy(block.y + block.h), block.w, block.h, block.facade, block.seed, active);
+      }
+      function drawDebris(piece) {
+        const top = sy(piece.y + piece.h);
+        ctx.save();
+        ctx.translate(piece.x + piece.w / 2, top + piece.h / 2);
+        ctx.rotate(piece.rot);
+        drawHouse(-piece.w / 2, -piece.h / 2, piece.w, piece.h, piece.facade, piece.seed, false);
+        ctx.restore();
+      }
+      function drawMute() {
+        const rect = muteRect();
+        ctx.fillStyle = "rgba(12, 8, 16, 0.28)";
+        roundRectPath(rect.x, rect.y, rect.w, rect.h, 12);
+        ctx.fill();
+        const x = rect.x + 13;
+        const y = rect.y + rect.h / 2;
+        ctx.fillStyle = "#fff6ea";
+        ctx.beginPath();
+        ctx.moveTo(x, y - 5);
+        ctx.lineTo(x + 5, y - 5);
+        ctx.lineTo(x + 11, y - 10);
+        ctx.lineTo(x + 11, y + 10);
+        ctx.lineTo(x + 5, y + 5);
+        ctx.lineTo(x, y + 5);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = "#fff6ea";
+        ctx.lineWidth = 2;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        if (muted) {
+          ctx.moveTo(x + 16, y - 6);
+          ctx.lineTo(x + 24, y + 6);
+          ctx.moveTo(x + 24, y - 6);
+          ctx.lineTo(x + 16, y + 6);
+        } else {
+          ctx.arc(x + 14, y, 5, -0.9, 0.9);
+          ctx.moveTo(x + 22, y - 8);
+          ctx.arc(x + 14, y, 9, -0.8, 0.8);
+        }
+        ctx.stroke();
+      }
+      function outlinedText(text, x, y, weight) {
+        ctx.lineWidth = weight || 3;
+        ctx.lineJoin = "round";
+        ctx.miterLimit = 2;
+        ctx.strokeStyle = "rgba(28, 14, 32, 0.5)";
+        ctx.strokeText(text, x, y);
+        ctx.fillText(text, x, y);
+      }
+      function drawPlayUi(now) {
+        const built = houses();
+        const top = safeTop();
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+        ctx.fillStyle = "#fff6ea";
+        ctx.font = "700 " + Math.min(40, viewW * 0.11) + "px Liberation Serif, Georgia, serif";
+        outlinedText(String(built), 18, top + 44, 4);
+        ctx.font = "600 14px Inter, Liberation Sans, sans-serif";
+        ctx.fillStyle = "rgba(255,246,234,0.92)";
+        if (!flash) {
+          const label = combo >= 2 ? "racha " + combo : zone(built);
+          outlinedText(label, 20, top + 68, 2.5);
+        }
+        if (state === "playing" && built === 0 && viewH > 460) {
+          const hintY = Math.min(viewH - 40, sy(0) + 76);
+          if (hintY > top + 190) {
+            ctx.textAlign = "center";
+            ctx.font = "600 16px Inter, Liberation Sans, sans-serif";
+            const pulse = 0.65 + 0.35 * (0.5 + 0.5 * Math.sin(now / 280));
+            ctx.globalAlpha = pulse;
+            outlinedText("Toca cuando calce", viewW / 2, hintY, 3);
+            ctx.globalAlpha = 1;
+          }
+        }
+        if (flash) {
+          ctx.save();
+          ctx.globalAlpha = Math.max(0, Math.min(1, flash.a));
+          ctx.textAlign = "center";
+          let size = 26;
+          ctx.font = "700 " + size + "px Liberation Serif, Georgia, serif";
+          while (ctx.measureText(flash.text).width > viewW - 48 && size > 16) {
+            size -= 1;
+            ctx.font = "700 " + size + "px Liberation Serif, Georgia, serif";
+          }
+          outlinedText(flash.text, viewW / 2, top + 96, 3);
+          ctx.restore();
+        }
+        drawMute();
+      }
+      function drawPaused() {
+        ctx.fillStyle = "rgba(10, 8, 16, 0.45)";
+        ctx.fillRect(0, 0, viewW, viewH);
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = "#fff6ea";
+        ctx.font = "700 36px Liberation Serif, Georgia, serif";
+        ctx.fillText("Pausa", viewW / 2, viewH / 2 - 12);
+        ctx.font = "500 16px Inter, Liberation Sans, sans-serif";
+        ctx.fillText("Toca para seguir", viewW / 2, viewH / 2 + 24);
+      }
+      function drawOver() {
+        const score = houses();
+        ctx.fillStyle = "rgba(10, 8, 16, 0.5)";
+        ctx.fillRect(0, 0, viewW, viewH);
+        const cw = Math.min(320, viewW - 40);
+        const ch = record || bestCombo >= 3 ? 292 : 264;
+        const x = (viewW - cw) / 2;
+        const y = (viewH - ch) / 2;
+        ctx.fillStyle = "#241628";
+        roundRectPath(x, y, cw, ch, 18);
+        ctx.fill();
+        ctx.textAlign = "center";
+        ctx.textBaseline = "alphabetic";
+        ctx.fillStyle = "#fff6ea";
+        ctx.font = "700 26px Liberation Serif, Georgia, serif";
+        const title = headline(score);
+        let size = 26;
+        ctx.font = "700 " + size + "px Liberation Serif, Georgia, serif";
+        while (ctx.measureText(title).width > cw - 32 && size > 16) {
+          size -= 1;
+          ctx.font = "700 " + size + "px Liberation Serif, Georgia, serif";
+        }
+        ctx.fillText(title, viewW / 2, y + 52);
+        ctx.font = "700 64px Liberation Serif, Georgia, serif";
+        ctx.fillText(String(score), viewW / 2, y + 128);
+        ctx.font = "500 15px Inter, Liberation Sans, sans-serif";
+        ctx.fillStyle = "rgba(255,246,234,0.78)";
+        ctx.fillText(score === 1 ? "casa" : "casas", viewW / 2, y + 152);
+        let extra = y + 184;
+        if (record) {
+          ctx.fillStyle = "#f2c14e";
+          ctx.font = "700 16px Inter, Liberation Sans, sans-serif";
+          ctx.fillText("Nuevo récord", viewW / 2, extra);
+          extra += 26;
+        } else {
+          ctx.fillStyle = "rgba(255,246,234,0.78)";
+          ctx.font = "500 15px Inter, Liberation Sans, sans-serif";
+          ctx.fillText("Mejor: " + best, viewW / 2, extra);
+          extra += 26;
+        }
+        if (bestCombo >= 3) {
+          ctx.fillStyle = "rgba(255,246,234,0.78)";
+          ctx.font = "500 15px Inter, Liberation Sans, sans-serif";
+          ctx.fillText("Mejor racha: " + bestCombo, viewW / 2, extra);
+        }
+        ctx.fillStyle = "#fff6ea";
+        const bw = Math.min(220, cw - 48);
+        const bh = 46;
+        const bx = (viewW - bw) / 2;
+        const by = y + ch - 66;
+        roundRectPath(bx, by, bw, bh, 23);
+        ctx.fill();
+        ctx.fillStyle = "#241628";
+        ctx.font = "700 16px Inter, Liberation Sans, sans-serif";
+        ctx.textBaseline = "middle";
+        ctx.fillText("Toca para otra", viewW / 2, by + bh / 2);
+      }
+      function drawTitle(now) {
+        drawSky(0);
+        drawStars(0.28);
+        const finePointer = window.matchMedia("(pointer: fine)").matches;
+        const buttonH = 48;
+        const buttonTop = viewH - safeBot() - (finePointer ? 34 : 20) - buttonH;
+        const titleSize = Math.min(64, viewW * 0.16);
+        const headerBottom = safeTop() + titleSize + (best > 0 ? 72 : 46);
+        drawMoon(Math.min(headerBottom + 36, buttonTop - 80));
+        let floors = viewH < 640 ? 3 : 4;
+        let bh = viewH < 640 ? 34 : 42;
+        const groundH = 16;
+        const gap = 10;
+        const regionTop = headerBottom + 28;
+        const regionBot = buttonTop - 8;
+        while (groundH + floors * bh + gap + bh > regionBot - regionTop && bh > 26) bh -= 2;
+        while (groundH + floors * bh + gap + bh > regionBot - regionTop && floors > 2) floors -= 1;
+        const sceneH = groundH + floors * bh + gap + bh;
+        const sceneTop = regionTop + Math.max(0, regionBot - regionTop - sceneH) * 0.42;
+        const moverY = sceneTop;
+        const housesTop = moverY + bh + gap;
+        const baseY = housesTop + floors * bh + groundH;
+        const bw = Math.min(190, viewW * 0.48);
+        drawMountains(baseY);
+        drawSea(baseY);
+        const gx = (viewW - bw) / 2 - 18;
+        ctx.fillStyle = "#7a5340";
+        ctx.fillRect(gx, baseY - groundH, bw + 36, groundH);
+        ctx.fillStyle = "#3f6b48";
+        ctx.fillRect(gx, baseY - groundH, bw + 36, 7);
+        const hx = (viewW - bw) / 2;
+        for (let i = 0; i < floors; i++) {
+          drawHouse(hx, housesTop + (floors - 1 - i) * bh, bw, bh, FACADES[i], i, false);
+        }
+        const amp = Math.min(viewW * 0.28, 130);
+        const mx = Math.max(12, Math.min(viewW - bw - 12, viewW / 2 - bw / 2 + Math.sin(now / 260) * amp));
+        drawHouse(mx, moverY, bw, bh, FACADES[4], 7, true);
+        if (regionBot - regionTop > sceneH + 30) {
+          drawGull(viewW * 0.16 + Math.sin(now / 700) * 8, regionTop + 8, 1);
+        }
+
+        ctx.textAlign = "center";
+        ctx.textBaseline = "alphabetic";
+        ctx.fillStyle = "#fff6ea";
+        ctx.font = "700 " + titleSize + "px Liberation Serif, Georgia, serif";
+        outlinedText("Cerro", viewW / 2, safeTop() + titleSize + 6, 4);
+        ctx.font = "500 16px Inter, Liberation Sans, sans-serif";
+        ctx.fillStyle = "rgba(255,246,234,0.92)";
+        outlinedText("Apila casas cerro arriba.", viewW / 2, safeTop() + titleSize + 32, 2.5);
+
+        if (best > 0) {
+          ctx.font = "600 15px Inter, Liberation Sans, sans-serif";
+          ctx.fillStyle = "#fff6ea";
+          outlinedText("Mejor: " + best + (best === 1 ? " casa" : " casas"), viewW / 2, safeTop() + titleSize + 58, 2.5);
+        }
+        ctx.fillStyle = "#fff6ea";
+        const label = "Toca para empezar";
+        ctx.font = "700 16px Inter, Liberation Sans, sans-serif";
+        const pillW = Math.min(viewW - 48, ctx.measureText(label).width + 40);
+        roundRectPath((viewW - pillW) / 2, buttonTop, pillW, buttonH, 24);
+        ctx.fill();
+        ctx.fillStyle = "#241628";
+        ctx.textBaseline = "middle";
+        ctx.fillText(label, viewW / 2, buttonTop + buttonH / 2);
+        const fine = window.matchMedia("(pointer: fine)").matches;
+        if (fine) {
+          ctx.textBaseline = "alphabetic";
+          ctx.fillStyle = "rgba(255,246,234,0.82)";
+          ctx.font = "500 13px Inter, Liberation Sans, sans-serif";
+          outlinedText("Espacio también sirve", viewW / 2, buttonTop - 12, 2);
+        }
+        drawMute();
+      }
+      function drawGull(x, y, s) {
+        ctx.strokeStyle = "rgba(255,246,234,0.85)";
+        ctx.lineWidth = 1.6;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(x - 8 * s, y);
+        ctx.quadraticCurveTo(x - 4 * s, y - 5 * s, x, y);
+        ctx.quadraticCurveTo(x + 4 * s, y - 5 * s, x + 8 * s, y);
+        ctx.stroke();
+      }
+      function drawWorld(alt) {
+        drawSky(alt);
+        drawStars(Math.max(0, Math.min(1, (alt - 0.15) * 1.3)));
+        drawMoon(safeTop() + 214);
+        const seaY = sy(0);
+        drawMountains(seaY);
+        drawSea(seaY);
+        for (const block of stack) drawBlock(block, false);
+        if (mover) drawBlock(mover, true);
+        for (const piece of debris) drawDebris(piece);
+        for (const bit of particles) {
+          ctx.globalAlpha = Math.max(0, bit.life);
+          ctx.fillStyle = bit.color;
+          ctx.fillRect(bit.x, sy(bit.y), 4, 4);
+        }
+        ctx.globalAlpha = 1;
+      }
+      function frame(now) {
+        const dt = Math.min(34, now - lastFrame);
+        lastFrame = now;
+        update(dt);
+        ctx.clearRect(0, 0, viewW, viewH);
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+        if (state === "title") {
+          drawTitle(now);
+        } else {
+          ctx.save();
+          if (shakeAmp > 0.2) {
+            ctx.translate(Math.sin(now / 18) * shakeAmp, Math.cos(now / 22) * shakeAmp * 0.35);
+          }
+          drawWorld(houses() / 16);
+          ctx.restore();
+          drawPlayUi(now);
+          if (state === "paused") drawPaused();
+          if (state === "over") drawOver();
+        }
+        requestAnimationFrame(frame);
+      }
+
+      loadSave();
+      resize();
+      window.addEventListener("resize", resize);
+      canvas.addEventListener("pointerdown", onPointer, { passive: false });
+      canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+      window.addEventListener("keydown", (event) => {
+        if (event.repeat) return;
+        if (event.code === "Space" || event.code === "Enter") {
+          event.preventDefault();
+          onAction();
+        } else if (event.key === "m" || event.key === "M") {
+          toggleMute();
+        }
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden && state === "playing") state = "paused";
+        lastFrame = performance.now();
+      });
+
+      requestAnimationFrame(frame);
+    })();
+  </script>
+</body>
+</html>

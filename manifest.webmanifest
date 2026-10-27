@@ -1,0 +1,10 @@
+{
+  "name": "Cerro",
+  "short_name": "Cerro",
+  "description": "Apila casas cerro arriba. Un toque.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#140e1c",
+  "theme_color": "#140e1c",
+  "lang": "es-CL"
+}
